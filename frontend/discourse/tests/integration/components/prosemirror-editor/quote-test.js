@@ -1,11 +1,20 @@
+import { settled, waitFor } from "@ember/test-helpers";
 import { module, test } from "qunit";
 import { setupRenderingTest } from "discourse/tests/helpers/component-test";
-import { testMarkdown } from "discourse/tests/helpers/rich-editor-helper";
+import pretender, { response } from "discourse/tests/helpers/create-pretender";
+import {
+  setupRichEditor,
+  testMarkdown,
+} from "discourse/tests/helpers/rich-editor-helper";
 
 module(
   "Integration | Component | prosemirror-editor - quote extension",
   function (hooks) {
     setupRenderingTest(hooks);
+
+    hooks.beforeEach(function () {
+      pretender.get("/u/:username/card.json", () => response(404, {}));
+    });
 
     Object.entries({
       "basic quote": [
@@ -47,6 +56,163 @@ module(
       test(name, async function (assert) {
         await testMarkdown(assert, markdown, html, expectedMarkdown);
       });
+    });
+
+    test("quote with a resolvable user avatar", async function (assert) {
+      // username unique to this test, as avatar lookups are cached module-wide
+      pretender.get("/u/avatared_user/card.json", (request) => {
+        assert.strictEqual(
+          request.queryParams.skip_track_visit,
+          "true",
+          "the lookup does not count as a profile visit"
+        );
+
+        return response({
+          user: { avatar_template: "/images/avatar.png?size={size}" },
+        });
+      });
+
+      const [editor] = await setupRichEditor(
+        assert,
+        `[quote="Full Name, post:123, topic:456, username:avatared_user"]\nQuoted text.\n\n[/quote]`
+      );
+
+      await waitFor("aside.quote .title img.avatar");
+
+      assert
+        .dom("aside.quote .title img.avatar")
+        .hasAttribute("src", /^\/images\/avatar\.png/);
+      assert.dom("aside.quote .title").hasText("Full Name:");
+
+      assert.strictEqual(
+        editor.value,
+        `[quote="Full Name, post:123, topic:456, username:avatared_user"]\nQuoted text.\n\n[/quote]\n\n`,
+        "avatar does not leak into the serialized markdown"
+      );
+    });
+
+    test("avatar follows a change of quoted user", async function (assert) {
+      pretender.get("/u/renamed_from/card.json", () =>
+        response({ user: { avatar_template: "/images/from.png?size={size}" } })
+      );
+      pretender.get("/u/renamed_to/card.json", () =>
+        response({ user: { avatar_template: "/images/to.png?size={size}" } })
+      );
+
+      const [editor] = await setupRichEditor(
+        assert,
+        `[quote="renamed_from"]\nQuoted text.\n\n[/quote]`
+      );
+      await waitFor("aside.quote .title img.avatar");
+
+      const { view } = editor;
+      let quotePos = null;
+      view.state.doc.descendants((node, pos) => {
+        if (node.type.name === "quote") {
+          quotePos = pos;
+        }
+      });
+
+      view.dispatch(
+        view.state.tr.setNodeMarkup(quotePos, null, {
+          ...view.state.doc.nodeAt(quotePos).attrs,
+          username: "renamed_to",
+        })
+      );
+      await settled();
+
+      assert.dom("aside.quote .title").hasText("renamed_to:");
+      assert
+        .dom("aside.quote .title img.avatar")
+        .hasAttribute("src", /^\/images\/to\.png/);
+    });
+
+    test("stale avatar is hidden while the replacement loads", async function (assert) {
+      let releaseSlowLookup;
+      const slowLookup = new Promise(
+        (resolve) => (releaseSlowLookup = resolve)
+      );
+
+      pretender.get("/u/quick_user/card.json", () =>
+        response({ user: { avatar_template: "/images/quick.png?size={size}" } })
+      );
+      pretender.get("/u/slow_user/card.json", async () => {
+        await slowLookup;
+        return response({
+          user: { avatar_template: "/images/slow.png?size={size}" },
+        });
+      });
+
+      const [editor] = await setupRichEditor(
+        assert,
+        `[quote="quick_user"]\nQuoted text.\n\n[/quote]`
+      );
+      await waitFor("aside.quote .title img.avatar");
+
+      const { view } = editor;
+      let quotePos = null;
+      view.state.doc.descendants((node, pos) => {
+        if (node.type.name === "quote") {
+          quotePos = pos;
+        }
+      });
+
+      view.dispatch(
+        view.state.tr.setNodeMarkup(quotePos, null, {
+          ...view.state.doc.nodeAt(quotePos).attrs,
+          username: "slow_user",
+        })
+      );
+
+      await waitFor("aside.quote .title", { count: 1 });
+      assert.dom("aside.quote .title").hasText("slow_user:");
+      assert
+        .dom("aside.quote .title img.avatar")
+        .doesNotExist("the previous user's avatar is not shown");
+
+      releaseSlowLookup();
+      await settled();
+
+      assert
+        .dom("aside.quote .title img.avatar")
+        .hasAttribute("src", /^\/images\/slow\.png/);
+    });
+
+    test("quote without a username renders no title", async function (assert) {
+      const [editor] = await setupRichEditor(
+        assert,
+        `[quote="removed_user"]\nQuoted text.\n\n[/quote]`
+      );
+      await settled();
+
+      const { view } = editor;
+      let quotePos = null;
+      view.state.doc.descendants((node, pos) => {
+        if (node.type.name === "quote") {
+          quotePos = pos;
+        }
+      });
+
+      view.dispatch(
+        view.state.tr.setNodeMarkup(quotePos, null, {
+          ...view.state.doc.nodeAt(quotePos).attrs,
+          username: null,
+        })
+      );
+      await settled();
+
+      assert.dom("aside.quote .title").doesNotExist();
+      assert.dom("aside.quote blockquote").hasText("Quoted text.");
+    });
+
+    test("quote survives repeated node view teardown", async function (assert) {
+      await testMarkdown(
+        assert,
+        `[quote="User"]\nQuoted text.\n\n[/quote]`,
+        `<aside class="quote" data-username="User" data-full="false"><div class="title">User:</div><blockquote><p>Quoted text.</p></blockquote></aside>`,
+        `[quote="User"]\nQuoted text.\n\n[/quote]\n\n`,
+        true
+      );
     });
   }
 );
